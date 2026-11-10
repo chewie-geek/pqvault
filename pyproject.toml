@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pqvault"
+version = "0.1.0"
+description = "File encryption designed to resist quantum computers (ML-KEM-768 + X25519 hybrid, Argon2id, AES-256-GCM)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["cryptography>=46", "click>=8.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+pqvault = "pqvault.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
