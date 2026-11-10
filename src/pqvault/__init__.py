@@ -1,6 +1,6 @@
 """pqvault: file encryption designed to stay secure against quantum computers."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 class PQVaultError(Exception):

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pqvault"
-version = "0.1.0"
-description = "File encryption designed to resist quantum computers (ML-KEM-768 + X25519 hybrid, Argon2id, AES-256-GCM)"
+version = "0.2.0"
+description = "File encryption and signatures designed to resist quantum computers (ML-KEM-768 + X25519, ML-DSA-65 + Ed25519, Argon2id, AES-256-GCM)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["cryptography>=46", "click>=8.1"]

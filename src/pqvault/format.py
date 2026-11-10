@@ -9,6 +9,17 @@ Every stanza wraps the same random 256-bit file key, so a file can be opened
 by a password or by any of several recipients. The header MAC (keyed from the
 file key) authenticates the whole header; the payload key is derived from the
 file key and the per-file payload salt.
+
+Signed files (flag FLAG_SIGNED) carry a fixed-size trailer at the END OF THE
+PLAINTEXT, so it is encrypted along with the data (only recipients learn who
+signed):
+
+    trailer = signed_at u64 | signer_public_identity (3200) | hybrid signature (3373)
+    signed message = domain | signed_at | SHA-512(header) | SHA-512(signer) | SHA-512(data)
+
+Binding the header means the signature covers this exact set of recipients:
+a recipient cannot strip the encryption and re-send the signed content to
+someone else under the original sender's name.
 """
 
 from __future__ import annotations
@@ -18,6 +29,7 @@ import hmac
 import io
 import os
 import struct
+import time
 from dataclasses import dataclass, field
 from typing import BinaryIO, Iterable, Sequence
 
@@ -26,7 +38,9 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from . import DecryptionError, PQVaultError, kem, stream
+from . import DecryptionError, PQVaultError, kem, signing, stream
+from .identity import (PUBLIC_SIZE, TIMESTAMP, Identity, PublicIdentity, SignatureInfo,
+                       require_fresh, require_signer, signable)
 from .password import DEFAULT_PARAMS, SALT_SIZE, Argon2Params, derive_key
 
 MAGIC = b"PQV1"
@@ -38,7 +52,11 @@ MAX_HEADER_SIZE = 1 << 20
 WRAPPED_KEY_SIZE = FILE_KEY_SIZE + 16
 
 FLAG_DIRECTORY = 0x01  # payload is a tar archive of a folder
-_KNOWN_FLAGS = FLAG_DIRECTORY
+FLAG_SIGNED = 0x02  # plaintext ends with a signature trailer
+_KNOWN_FLAGS = FLAG_DIRECTORY | FLAG_SIGNED
+
+TRAILER_SIZE = TIMESTAMP.size + PUBLIC_SIZE + signing.SIGNATURE_SIZE
+_SIG_CONTEXT = b"pqvault-v1 file"
 
 STANZA_PASSWORD = 1
 STANZA_RECIPIENT = 2
@@ -108,6 +126,8 @@ def encrypt(
     recipients: Sequence[kem.PublicKey] = (),
     flags: int = 0,
     argon_params: Argon2Params | None = None,
+    signer: Identity | None = None,
+    signed_at: int | None = None,
 ) -> None:
     if not passwords and not recipients:
         raise PQVaultError("need at least one password or recipient")
@@ -117,6 +137,9 @@ def encrypt(
 
     file_key = os.urandom(FILE_KEY_SIZE)
     payload_salt = os.urandom(PAYLOAD_SALT_SIZE)
+    if signer is not None:
+        signable(signer.public)
+        flags |= FLAG_SIGNED
     stanzas = [(STANZA_PASSWORD, _password_stanza(file_key, p, params)) for p in passwords]
     stanzas += [(STANZA_RECIPIENT, _recipient_stanza(file_key, r)) for r in recipients]
 
@@ -126,6 +149,9 @@ def encrypt(
     authenticated = _PREFIX.pack(MAGIC, VERSION, len(body)) + bytes(body)
 
     dst.write(authenticated + _mac(file_key, authenticated))
+    if signer is not None:
+        when = int(time.time()) if signed_at is None else signed_at
+        src = _SigningReader(src, signer, authenticated, when)
     stream.encrypt(_payload_key(file_key, payload_salt), src, dst)
 
 
@@ -205,8 +231,81 @@ def _payload_key(file_key: bytes, payload_salt: bytes) -> bytes:
     return _hkdf(file_key, payload_salt, b"pqvault-v1 payload")
 
 
-def decrypt_payload(header: Header, file_key: bytes, src: BinaryIO, dst: BinaryIO) -> None:
-    stream.decrypt(_payload_key(file_key, header.payload_salt), src, dst)
+def _signed_message(header_bytes: bytes, signer: PublicIdentity, data_digest: bytes, signed_at: int) -> bytes:
+    return (
+        b"pqvault-v1 file signature\x00"
+        + TIMESTAMP.pack(signed_at)
+        + hashlib.sha512(header_bytes).digest()
+        + hashlib.sha512(signer.raw).digest()
+        + data_digest
+    )
+
+
+class _SigningReader:
+    """Passes data through while hashing it; at EOF, emits the signature trailer."""
+
+    def __init__(self, src: BinaryIO, signer: Identity, header_bytes: bytes, signed_at: int):
+        self._src, self._signer, self._header, self._when = src, signer, header_bytes, signed_at
+        self._hash = hashlib.sha512()
+        self._tail: bytes | None = None
+
+    def read(self, n: int) -> bytes:
+        if self._tail is None:
+            data = self._src.read(n)
+            if data:
+                self._hash.update(data)
+                return data
+            pub = self._signer.public
+            msg = _signed_message(self._header, pub, self._hash.digest(), self._when)
+            sig = signing.sign(self._signer.signing, msg, _SIG_CONTEXT)
+            self._tail = TIMESTAMP.pack(self._when) + pub.raw + sig
+        out, self._tail = self._tail[:n], self._tail[n:]
+        return out
+
+
+class _VerifyingWriter:
+    """Writes all but the last TRAILER_SIZE bytes through, hashing them."""
+
+    def __init__(self, dst: BinaryIO):
+        self._dst = dst
+        self._buf = bytearray()
+        self._hash = hashlib.sha512()
+
+    def write(self, data: bytes) -> None:
+        self._buf += data
+        if len(self._buf) > TRAILER_SIZE:
+            cut = len(self._buf) - TRAILER_SIZE
+            out = bytes(self._buf[:cut])
+            self._hash.update(out)
+            self._dst.write(out)
+            del self._buf[:cut]
+
+    def finish(self, header_bytes: bytes) -> SignatureInfo:
+        if len(self._buf) != TRAILER_SIZE:
+            raise signing.SignatureError("signed file is missing its signature")
+        trailer = bytes(self._buf)
+        (signed_at,) = TIMESTAMP.unpack_from(trailer)
+        key_end = TIMESTAMP.size + PUBLIC_SIZE
+        signer = PublicIdentity.from_raw(trailer[TIMESTAMP.size : key_end])
+        if signer.verify is None:
+            raise signing.SignatureError("malformed signer key")
+        msg = _signed_message(header_bytes, signer, self._hash.digest(), signed_at)
+        signing.verify(signer.verify, trailer[key_end:], msg, _SIG_CONTEXT)
+        return SignatureInfo(signer, signed_at)
+
+
+def decrypt_payload(header: Header, file_key: bytes, src: BinaryIO, dst: BinaryIO) -> SignatureInfo | None:
+    """Decrypt the payload; for signed files, verify the signature and return the signer.
+
+    The caller must treat output as untrusted until this returns (the CLI
+    writes to a temp file and discards it on any error)."""
+    key = _payload_key(file_key, header.payload_salt)
+    if not header.flags & FLAG_SIGNED:
+        stream.decrypt(key, src, dst)
+        return None
+    writer = _VerifyingWriter(dst)
+    stream.decrypt(key, src, writer)
+    return writer.finish(header.authenticated)
 
 
 def decrypt(
@@ -215,8 +314,16 @@ def decrypt(
     *,
     password: bytes | None = None,
     identities: Iterable[kem.PrivateKey] = (),
-) -> Header:
+    trusted: Sequence[PublicIdentity] | None = None,
+    max_age: int | None = None,
+) -> SignatureInfo | None:
+    """Decrypt a whole file. If `trusted` is given, the file must be signed by
+    one of them; if `max_age` (seconds) is given, the signature must be that recent."""
     header = read_header(src)
     file_key = unlock(header, password=password, identities=identities)
-    decrypt_payload(header, file_key, src, dst)
-    return header
+    info = decrypt_payload(header, file_key, src, dst)
+    if trusted is not None:
+        require_signer(info, list(trusted))
+    if max_age is not None:
+        require_fresh(info, max_age)
+    return info

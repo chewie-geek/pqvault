@@ -8,3 +8,4 @@ dist/
 # never commit keys or encrypted test output
 *.key
 *.pqv
+.DS_Store
