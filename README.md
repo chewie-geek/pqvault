@@ -15,7 +15,50 @@ python3 -m venv .venv
 .venv/bin/pqvault --help
 ```
 
-## Usage
+## The app
+
+Run `pqvault` with no arguments to open the full-screen app:
+
+```
+┌ Menu ──────────────┐┌ Saved keys ──────────────────────────────────────┐
+│ Encrypt        (e) ││ ★ ethan   mine     CDD9 391B C87E D1E6 9796 ...  │
+│ Decrypt        (d) ││   alice   contact  FF75 36B5 3B36 8E1B F5A5 ...  │
+│ Sign file      (s) │└──────────────────────────────────────────────────┘
+│ Verify file    (v) │┌ Activity ────────────────────────────────────────┐
+│ Keys           (k) ││ 13:47 Encrypted taxes.pdf -> taxes.pdf.pqv       │
+│ Show fingerprint(f)││   opens with: alice; signed by ethan             │
+│ Exit           (q) ││                                                  │
+└────────────────────┘└──────────────────────────────────────────────────┘
+```
+
+Each action opens a form. **Encrypt** and **Decrypt** work *with a key* (to/from
+people in your keyring) or *without a key* (a password). **Keys** lets you
+create your own key, import a contact's public key (after checking its
+fingerprint with them), show your public key to share it, set your default
+key, and remove contacts. Files open with a **Browse…** picker or a typed path.
+Encryption runs in the background, so the screen never freezes.
+
+### Saved keys (keyring)
+
+Keys live in `~/.pqvault/` (override with `$PQVAULT_HOME`):
+`identities/` holds your own keypairs (private keys passphrase-protected,
+folder readable only by you), `contacts/` holds the public keys you've imported.
+Importing a contact is a statement of trust, so do it only after confirming
+the fingerprint with them.
+
+## Command line
+
+Every app feature is also a command, for scripts. Anywhere a key is expected,
+you can give a key file **or** a saved key name.
+
+```bash
+pqvault keys create ethan                 # your key, saved in the keyring
+pqvault keys import alice alice.pub       # shows fingerprint, asks you to confirm
+pqvault keys list
+pqvault keys export ethan > ethan.pub     # share this
+pqvault encrypt plan.pdf -r alice -s ethan
+pqvault decrypt reply.pdf.pqv --from alice   # uses your default key
+```
 
 ```bash
 # Password-protected

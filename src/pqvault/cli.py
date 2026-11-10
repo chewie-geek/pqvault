@@ -1,24 +1,29 @@
-"""Command-line interface: pqvault keygen | encrypt | decrypt | sign | verify | fingerprint."""
+"""Command line. `pqvault` alone opens the interactive app; subcommands are for scripts.
+
+Anywhere a key is expected you can give either a file path or the name of a
+key saved in your keyring (see `pqvault keys`).
+"""
 
 from __future__ import annotations
 
-import os
 import re
 import time
 from datetime import datetime, timezone
-import shutil
-import tarfile
-import tempfile
-from contextlib import contextmanager
+from functools import cache
 from pathlib import Path
-from typing import Callable, Iterator
 
 import click
 
-from . import PQVaultError, __version__, detached, format, keys
-from .identity import CLOCK_SKEW, Identity, PublicIdentity, SignatureInfo, require_fresh, require_signer
+from . import PQVaultError, __version__, keys, ops
+from .identity import CLOCK_SKEW, Identity, PublicIdentity, SignatureInfo
+from .keyring import Keyring
 
-SUFFIX = ".pqv"
+# ---------------------------------------------------------------- helpers
+
+
+@cache
+def _keyring() -> Keyring:
+    return Keyring()
 
 
 def _prompt_secret(label: str, confirm: bool) -> bytes:
@@ -28,33 +33,34 @@ def _prompt_secret(label: str, confirm: bool) -> bytes:
     return value.encode()
 
 
-@contextmanager
-def _atomic_output(target: Path, force: bool) -> Iterator[Path]:
-    """Yield a temp path next to target; move it into place only on success."""
-    if target.exists() and not force:
-        raise click.ClickException(f"{target} already exists (use --force to overwrite)")
-    fd, tmp = tempfile.mkstemp(prefix=".pqvault-", dir=target.parent or ".")
-    os.close(fd)
-    tmp_path = Path(tmp)
-    try:
-        yield tmp_path
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
-    if target.is_dir():
-        shutil.rmtree(target)
-    os.replace(tmp_path, target)
+def _resolve_public(ref: str) -> PublicIdentity:
+    p = Path(ref)
+    return keys.decode_public(p.read_text()) if p.is_file() else _keyring().public(ref)
 
 
-def _load_identity(path: Path) -> Identity:
-    return keys.decode_private(path.read_text(), _prompt_secret(f"Passphrase for {path}", confirm=False))
+def _resolve_identity(ref: str) -> Identity:
+    p = Path(ref)
+    passphrase = _prompt_secret(f"Passphrase for {ref}", confirm=False)
+    if p.is_file():
+        return keys.decode_private(p.read_text(), passphrase)
+    return _keyring().load_identity(ref, passphrase)
 
 
-def _load_publics(paths: tuple[Path, ...]) -> list[PublicIdentity]:
-    return [keys.decode_public(p.read_text()) for p in paths]
+def _default_identity_name() -> str:
+    name = _keyring().default
+    if not name:
+        raise PQVaultError("no key given and no default key saved (use -i, or `pqvault keys create NAME`)")
+    return name
 
 
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def parse_duration(text: str) -> int:
+    m = re.fullmatch(r"\s*(\d+)\s*([smhdw])\s*", str(text).lower())
+    if not m:
+        raise ValueError(f"{text!r} is not a duration like 30m, 12h, 7d or 2w")
+    return int(m.group(1)) * _UNITS[m.group(2)]
 
 
 class Duration(click.ParamType):
@@ -65,87 +71,77 @@ class Duration(click.ParamType):
     def convert(self, value, param, ctx):
         if isinstance(value, int):
             return value
-        m = re.fullmatch(r"\s*(\d+)\s*([smhdw])\s*", str(value).lower())
-        if not m:
-            self.fail(f"{value!r} is not a duration like 30m, 12h, 7d or 2w", param, ctx)
-        return int(m.group(1)) * _UNITS[m.group(2)]
+        try:
+            return parse_duration(value)
+        except ValueError as e:
+            self.fail(str(e), param, ctx)
 
 
-def _ago(seconds: float) -> str:
+def ago(seconds: float) -> str:
     future = seconds < 0
     seconds = abs(seconds)
     for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
         if seconds >= size:
             n = int(seconds // size)
             text = f"{n} {unit}{'s' if n != 1 else ''}"
-            break
-    else:
-        text = "just now" if not future else "a few seconds"
-        return text if not future else f"in {text}"
-    return f"in {text}" if future else f"{text} ago"
+            return f"in {text}" if future else f"{text} ago"
+    return "in a few seconds" if future else "just now"
 
 
-def _when(signed_at: int) -> str:
+def when(signed_at: int) -> str:
     local = datetime.fromtimestamp(signed_at, tz=timezone.utc).astimezone()
-    return f"{local:%Y-%m-%d %H:%M:%S %Z} ({_ago(time.time() - signed_at)})"
+    return f"{local:%Y-%m-%d %H:%M:%S %Z} ({ago(time.time() - signed_at)})"
 
 
-def _describe_signature(info: SignatureInfo | None, trusted: list[PublicIdentity] | None) -> None:
+def describe_signature(info: SignatureInfo | None, trusted: bool, keyring: Keyring | None) -> list[str]:
+    """Human-readable lines about a verified signature (shared with the app)."""
     if info is None:
-        click.echo("Not signed: this file does not prove who created it.")
-        return
+        return ["Not signed: this file does not prove who created it."]
+    saved = keyring.lookup(info.signer) if keyring else None
+    who = f"{saved.label} [{info.signer.fingerprint}]" if saved else info.signer.fingerprint
     if trusted:
-        click.echo(f"Good signature from trusted key {info.signer.fingerprint}")
+        lines = [f"Good signature from trusted key {who}"]
+    elif saved:
+        lines = [f"Good signature from {who} (a key in your keyring)"]
     else:
-        click.echo(f"Signed by key {info.signer.fingerprint}")
-        click.echo("  (not checked against a key you trust: compare this fingerprint with the sender,")
-        click.echo("   or pass --from THEIR.pub to require it)")
-    click.echo(f"Signed at {_when(info.signed_at)}, according to the signer's clock")
+        lines = [f"Signed by unknown key {who}",
+                 "  (not in your keyring: compare this fingerprint with the sender,",
+                 "   or import their key / pass --from to require it)"]
+    lines.append(f"Signed at {when(info.signed_at)}, according to the signer's clock")
     if info.signed_at > time.time() + CLOCK_SKEW:
-        click.echo("  Warning: this time is in the future; the signer's clock may be wrong.")
+        lines.append("  Warning: this time is in the future; the signer's clock may be wrong.")
+    return lines
 
 
-def _decrypt_folder(header, file_key: bytes, src, output: Path, force: bool,
-                    check: Callable[[SignatureInfo | None], None]) -> SignatureInfo | None:
-    """Authenticate (and verify) the whole archive first, then extract and move into place."""
-    if output.exists() and not force:
-        raise click.ClickException(f"{output} already exists (use --force to overwrite)")
-    staging = Path(tempfile.mkdtemp(prefix=".pqvault-", dir=output.parent or "."))
-    try:
-        with tempfile.TemporaryFile() as spool:
-            signer = format.decrypt_payload(header, file_key, src, spool)
-            check(signer)
-            spool.seek(0)
-            with tarfile.open(fileobj=spool, mode="r") as tar:
-                tar.extractall(staging, filter="data")  # blocks ../ and absolute paths
-        entries = list(staging.iterdir())
-        if len(entries) != 1 or not entries[0].is_dir():
-            raise PQVaultError("encrypted folder archive has an unexpected layout")
-        if output.exists():
-            shutil.rmtree(output) if output.is_dir() else output.unlink()
-        os.replace(entries[0], output)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-    return signer
+def _fail(e: PQVaultError):
+    raise click.ClickException(str(e))
 
 
-@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+# ---------------------------------------------------------------- commands
+
+
+@click.group(context_settings={"help_option_names": ["-h", "--help"]}, invoke_without_command=True)
 @click.version_option(__version__, prog_name="pqvault")
-def main() -> None:
-    """Encrypt files so they stay secret even against quantum computers."""
+@click.pass_context
+def main(ctx: click.Context) -> None:
+    """Encrypt and sign files so they stay secure even against quantum computers.
+
+    Run with no command to open the interactive app."""
+    if ctx.invoked_subcommand is None:
+        from .app import run_app
+        run_app()
 
 
 @main.command()
 @click.option("-o", "--output", "base", required=True, type=click.Path(path_type=Path),
               help="Base name: writes BASE.pub and BASE.key")
 def keygen(base: Path) -> None:
-    """Create a post-quantum identity: encryption (ML-KEM-768 + X25519)
-    and signing (ML-DSA-65 + Ed25519) keys."""
+    """Create a keypair as loose files (see `pqvault keys create` to save one in your keyring)."""
     passphrase = _prompt_secret("Passphrase to protect the private key", confirm=True)
     try:
         pub, key, identity = keys.write_keypair(base, passphrase)
     except PQVaultError as e:
-        raise click.ClickException(str(e))
+        _fail(e)
     click.echo(f"Public key (share this):   {pub}")
     click.echo(f"Private key (keep secret): {key}")
     click.echo(f"Fingerprint: {identity.public.fingerprint}")
@@ -154,143 +150,192 @@ def keygen(base: Path) -> None:
 @main.command()
 @click.argument("path", type=click.Path(exists=True, path_type=Path))
 @click.option("-p", "--password", "use_password", is_flag=True, help="Lock with a password.")
-@click.option("-r", "--recipient", "recipients", multiple=True, type=click.Path(exists=True, dir_okay=False, path_type=Path),
-              help="Recipient public key file (repeatable).")
-@click.option("-s", "--sign", "sign_with", type=click.Path(exists=True, dir_okay=False, path_type=Path),
-              help="Sign with your private key so recipients can prove it came from you.")
+@click.option("-r", "--recipient", "recipients", multiple=True, metavar="KEY",
+              help="Recipient: public key file or saved key name (repeatable).")
+@click.option("-s", "--sign", "sign_with", metavar="KEY",
+              help="Sign with your private key (file or saved name) so recipients can prove it came from you.")
 @click.option("-o", "--output", type=click.Path(path_type=Path), help="Output file (default: PATH.pqv).")
 @click.option("-f", "--force", is_flag=True, help="Overwrite the output if it exists.")
-def encrypt(path: Path, use_password: bool, recipients: tuple[Path, ...], sign_with: Path | None,
+def encrypt(path: Path, use_password: bool, recipients: tuple[str, ...], sign_with: str | None,
             output: Path | None, force: bool) -> None:
     """Encrypt a file or folder."""
     if not use_password and not recipients:
         raise click.UsageError("choose --password and/or at least one --recipient")
-    target = output or path.with_name(path.name + SUFFIX)
     try:
-        pubs = [r.kem for r in _load_publics(recipients)]
-        signer = _load_identity(sign_with) if sign_with else None
+        pubs = [_resolve_public(r) for r in recipients]
+        signer = _resolve_identity(sign_with) if sign_with else None
         passwords = [_prompt_secret("Password", confirm=True)] if use_password else []
-        with _atomic_output(target, force) as tmp, open(tmp, "wb") as dst:
-            opts = dict(passwords=passwords, recipients=pubs, signer=signer)
-            if path.is_dir():
-                with tempfile.TemporaryFile() as spool:
-                    with tarfile.open(fileobj=spool, mode="w") as tar:
-                        tar.add(path, arcname=path.name)
-                    spool.seek(0)
-                    format.encrypt(spool, dst, flags=format.FLAG_DIRECTORY, **opts)
-            else:
-                with open(path, "rb") as src:
-                    format.encrypt(src, dst, **opts)
+        target = ops.encrypt_path(path, output, passwords=passwords, recipients=pubs, signer=signer, force=force)
     except PQVaultError as e:
-        raise click.ClickException(str(e))
+        _fail(e)
     click.echo(f"Encrypted{' and signed' if signer else ''} -> {target}")
 
 
 @main.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option("-i", "--identity", "identities", multiple=True, type=click.Path(exists=True, dir_okay=False, path_type=Path),
-              help="Your private key file (repeatable).")
-@click.option("--from", "senders", multiple=True, type=click.Path(exists=True, dir_okay=False, path_type=Path),
-              help="Require a valid signature from this public key (repeatable: any one is accepted).")
+@click.option("-i", "--identity", "identities", multiple=True, metavar="KEY",
+              help="Your private key: file or saved name (repeatable). Default: password, else your default key.")
+@click.option("--from", "senders", multiple=True, metavar="KEY",
+              help="Require a valid signature from this public key: file or saved name (repeatable).")
 @click.option("--max-age", type=Duration(), metavar="DURATION",
               help="Reject signatures older than this, e.g. 30m, 12h, 7d (blocks replayed old files).")
 @click.option("-o", "--output", type=click.Path(path_type=Path), help="Output path (default: PATH without .pqv).")
 @click.option("-f", "--force", is_flag=True, help="Overwrite the output if it exists.")
-def decrypt(path: Path, identities: tuple[Path, ...], senders: tuple[Path, ...], max_age: int | None,
+def decrypt(path: Path, identities: tuple[str, ...], senders: tuple[str, ...], max_age: int | None,
             output: Path | None, force: bool) -> None:
     """Decrypt a .pqv file."""
-    if output is None:
-        if path.suffix != SUFFIX:
-            raise click.UsageError("input does not end in .pqv; give --output")
-        output = path.with_suffix("")
     try:
-        trusted = _load_publics(senders) or None
-        with open(path, "rb") as src:
-            header = format.read_header(src)
-            idents, password = [], None
-            if identities:
-                idents = [_load_identity(i).kem for i in identities]
-            elif header.has_password:
-                password = _prompt_secret("Password", confirm=False)
-            else:
-                raise click.UsageError("this file needs a private key; pass --identity")
-            file_key = format.unlock(header, password=password, identities=idents)
-
-            def check(info: SignatureInfo | None) -> None:
-                if trusted:
-                    require_signer(info, trusted)
-                if max_age is not None:
-                    require_fresh(info, max_age)
-
-            if header.flags & format.FLAG_DIRECTORY:
-                signer = _decrypt_folder(header, file_key, src, output, force, check)
-            else:
-                with _atomic_output(output, force) as tmp, open(tmp, "wb") as dst:
-                    signer = format.decrypt_payload(header, file_key, src, dst)
-                    check(signer)  # raising here discards the temp file
+        if output is None:
+            output = ops.default_decrypt_output(path)
+        trusted = [_resolve_public(s) for s in senders] or None
+        password, idents = None, []
+        if identities:
+            idents = [_resolve_identity(i).kem for i in identities]
+        elif ops.needs_password(path):
+            password = _prompt_secret("Password", confirm=False)
+        else:
+            idents = [_resolve_identity(_default_identity_name()).kem]
+        target, info = ops.decrypt_path(path, output, password=password, identities=idents,
+                                        trusted=trusted, max_age=max_age, force=force)
     except PQVaultError as e:
-        raise click.ClickException(str(e))
-    click.echo(f"Decrypted -> {output}")
-    _describe_signature(signer, trusted)
+        _fail(e)
+    click.echo(f"Decrypted -> {target}")
+    for line in describe_signature(info, bool(trusted), _keyring()):
+        click.echo(line)
 
 
 @main.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option("-i", "--identity", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path),
-              help="Your private key file.")
+@click.option("-i", "--identity", metavar="KEY", help="Your private key: file or saved name (default: your default key).")
 @click.option("-o", "--output", type=click.Path(path_type=Path), help="Signature file (default: PATH.sig).")
 @click.option("-f", "--force", is_flag=True, help="Overwrite the output if it exists.")
-def sign(path: Path, identity: Path, output: Path | None, force: bool) -> None:
+def sign(path: Path, identity: str | None, output: Path | None, force: bool) -> None:
     """Sign a file without encrypting it (writes a detached .sig file)."""
-    target = output or path.with_name(path.name + ".sig")
     try:
-        ident = _load_identity(identity)
-        with open(path, "rb") as src:
-            text = detached.sign(ident, src)
-        with _atomic_output(target, force) as tmp:
-            tmp.write_text(text)
-            tmp.chmod(0o644)  # signatures are public, unlike decrypted files
+        ident = _resolve_identity(identity or _default_identity_name())
+        target = ops.sign_path(path, ident, output, force)
     except PQVaultError as e:
-        raise click.ClickException(str(e))
+        _fail(e)
     click.echo(f"Signed -> {target}")
     click.echo(f"Fingerprint: {ident.public.fingerprint}")
-    click.echo(f"Signed at {_when(int(time.time()))}")
+    click.echo(f"Signed at {when(int(time.time()))}")
 
 
 @main.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option("--from", "senders", required=True, multiple=True,
-              type=click.Path(exists=True, dir_okay=False, path_type=Path),
-              help="Public key you expect the signature to come from (repeatable).")
+@click.option("--from", "senders", required=True, multiple=True, metavar="KEY",
+              help="Public key you expect the signature from: file or saved name (repeatable).")
 @click.option("--sig", "sig_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               help="Signature file (default: PATH.sig).")
 @click.option("--max-age", type=Duration(), metavar="DURATION",
               help="Reject signatures older than this, e.g. 30m, 12h, 7d.")
-def verify(path: Path, senders: tuple[Path, ...], sig_path: Path | None, max_age: int | None) -> None:
+def verify(path: Path, senders: tuple[str, ...], sig_path: Path | None, max_age: int | None) -> None:
     """Check that a file was signed by someone you trust and hasn't changed."""
-    sig_path = sig_path or path.with_name(path.name + ".sig")
-    if not sig_path.exists():
-        raise click.UsageError(f"signature file {sig_path} not found; pass --sig")
     try:
-        trusted = _load_publics(senders)
-        with open(path, "rb") as src:
-            info = detached.verify(sig_path.read_text(), src, trusted, max_age=max_age)
+        trusted = [_resolve_public(s) for s in senders]
+        info = ops.verify_path(path, trusted, sig_path, max_age)
     except PQVaultError as e:
-        raise click.ClickException(str(e))
-    _describe_signature(info, trusted)
+        _fail(e)
+    for line in describe_signature(info, True, _keyring()):
+        click.echo(line)
 
 
 @main.command()
-@click.argument("pubkey", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-def fingerprint(pubkey: Path) -> None:
-    """Show a public key's fingerprint (compare it with its owner in person or by phone)."""
+@click.argument("key", metavar="KEY")
+def fingerprint(key: str) -> None:
+    """Show a public key's fingerprint (file or saved name). Compare it with its owner in person or by phone."""
     try:
-        pub = keys.decode_public(pubkey.read_text())
+        pub = _resolve_public(key)
     except PQVaultError as e:
-        raise click.ClickException(str(e))
+        _fail(e)
     click.echo(pub.fingerprint)
     if pub.verify is None:
         click.echo("(old v0.1 key: encryption only, cannot sign)")
+
+
+# ---------------------------------------------------------------- keyring
+
+
+@main.group("keys")
+def keys_group() -> None:
+    """Manage saved keys (stored in ~/.pqvault, or $PQVAULT_HOME)."""
+
+
+@keys_group.command("list")
+def keys_list() -> None:
+    """List your keys and your contacts' keys."""
+    kr = _keyring()
+    default = kr.default
+    entries = kr.all()
+    if not entries:
+        click.echo("No saved keys. Create one with `pqvault keys create NAME`.")
+    for e in entries:
+        star = "*" if e.mine and e.name == default else " "
+        kind = "mine   " if e.mine else "contact"
+        click.echo(f"{star} {kind}  {e.name:<20} {e.public.fingerprint}")
+
+
+@keys_group.command("create")
+@click.argument("name")
+def keys_create(name: str) -> None:
+    """Create a new keypair of your own and save it."""
+    try:
+        passphrase = _prompt_secret("Passphrase to protect the private key", confirm=True)
+        entry = _keyring().create_identity(name, passphrase)
+    except PQVaultError as e:
+        _fail(e)
+    click.echo(f"Created {entry.name}: {entry.public.fingerprint}")
+    click.echo(f"Share your public key file: {_keyring().public_path(name)}")
+
+
+@keys_group.command("import")
+@click.argument("name")
+@click.argument("pubfile", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("-y", "--yes", is_flag=True, help="Skip the fingerprint confirmation.")
+def keys_import(name: str, pubfile: Path, yes: bool) -> None:
+    """Save someone's public key under NAME."""
+    try:
+        text = pubfile.read_text()
+        pub = _keyring().preview_contact(text)
+        click.echo(f"Fingerprint: {pub.fingerprint}")
+        if not yes:
+            click.confirm(f"Did you confirm this fingerprint with {name} in person or over a trusted call?", abort=True)
+        _keyring().import_contact(name, text)
+    except PQVaultError as e:
+        _fail(e)
+    click.echo(f"Saved {name}.")
+
+
+@keys_group.command("export")
+@click.argument("name")
+def keys_export(name: str) -> None:
+    """Print one of your public keys, to share."""
+    try:
+        click.echo(_keyring().public_path(name).read_text().strip())
+    except PQVaultError as e:
+        _fail(e)
+
+
+@keys_group.command("remove")
+@click.argument("name")
+def keys_remove(name: str) -> None:
+    """Remove a contact's key."""
+    try:
+        _keyring().remove_contact(name)
+    except PQVaultError as e:
+        _fail(e)
+    click.echo(f"Removed {name}.")
+
+
+@keys_group.command("default")
+@click.argument("name")
+def keys_default(name: str) -> None:
+    """Choose which of your keys is used when none is given."""
+    try:
+        _keyring().default = name
+    except PQVaultError as e:
+        _fail(e)
+    click.echo(f"Default key is now {name}.")
 
 
 if __name__ == "__main__":

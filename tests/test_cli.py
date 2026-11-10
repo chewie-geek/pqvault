@@ -130,7 +130,7 @@ def test_unverified_signature_shows_fingerprint(tmp_path):
     run("encrypt", f, "-p", "-s", tmp_path / "alice.key", input="a\npw\npw\n")
     r = run("decrypt", tmp_path / "m.txt.pqv", "-o", tmp_path / "o.txt", input="pw\n")
     fp = run("fingerprint", tmp_path / "alice.pub").output.strip()
-    assert r.exit_code == 0 and fp in r.output and "not checked" in r.output
+    assert r.exit_code == 0 and fp in r.output and "not in your keyring" in r.output
 
 
 def test_detached_sign_verify_cli(tmp_path):
@@ -175,3 +175,45 @@ def test_verify_max_age_cli(tmp_path):
     run("sign", f, "-i", tmp_path / "alice.key", input="a\n")
     r = run("verify", f, "--from", tmp_path / "alice.pub", "--max-age", "1h")
     assert r.exit_code == 0 and "Signed at" in r.output, r.output
+
+
+def test_keyring_cli_flow(tmp_path):
+    """Save keys by name, then use names instead of file paths everywhere."""
+    assert run("keys", "create", "me", input="m\nm\n").exit_code == 0
+    run("keygen", "-o", tmp_path / "alice", input="a\na\n")
+    r = run("keys", "import", "alice", tmp_path / "alice.pub", input="y\n")
+    assert r.exit_code == 0 and "Fingerprint" in r.output, r.output
+    listing = run("keys", "list").output
+    assert "* mine" in listing and "alice" in listing
+
+    f = tmp_path / "hello.txt"
+    f.write_text("hi me")
+    # alice signs (from her file), encrypts to "me" by name
+    assert run("encrypt", f, "-r", "me", "-s", tmp_path / "alice.key", input="a\n").exit_code == 0
+    # no -i: uses the default key; --from by name
+    r = run("decrypt", tmp_path / "hello.txt.pqv", "--from", "alice", "-o", tmp_path / "out.txt", input="m\n")
+    assert r.exit_code == 0, r.output
+    assert "trusted key alice" in r.output
+    assert (tmp_path / "out.txt").read_text() == "hi me"
+
+    exported = run("keys", "export", "me").output.strip()
+    assert exported.startswith("pqv2pub:")
+    assert run("keys", "remove", "alice").exit_code == 0
+
+
+def test_import_requires_confirmation(tmp_path):
+    run("keygen", "-o", tmp_path / "x", input="a\na\n")
+    r = run("keys", "import", "x", tmp_path / "x.pub", input="n\n")
+    assert r.exit_code != 0
+    assert "x" not in run("keys", "list").output.split()
+
+
+def test_signed_by_saved_contact_named_without_from(tmp_path):
+    run("keys", "create", "me", input="m\nm\n")
+    run("keygen", "-o", tmp_path / "alice", input="a\na\n")
+    run("keys", "import", "alice", tmp_path / "alice.pub", "--yes")
+    f = tmp_path / "n.txt"
+    f.write_text("x")
+    run("encrypt", f, "-r", "me", "-s", tmp_path / "alice.key", input="a\n")
+    r = run("decrypt", tmp_path / "n.txt.pqv", "-o", tmp_path / "o", input="m\n")
+    assert "from alice" in r.output and "in your keyring" in r.output, r.output
