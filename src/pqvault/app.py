@@ -695,6 +695,12 @@ class PqvaultApp(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        # Restore the theme chosen last time (Ctrl+P → "Change theme"), and save future changes.
+        saved = self.keyring.setting("theme")
+        if saved in self.available_themes:
+            self.theme = saved
+        self.theme_changed_signal.subscribe(self, self._save_theme)
+
         self.query_one("#menu").border_title = "Menu"
         keys_table = self.query_one("#keys", DataTable)
         keys_table.border_title = "Saved keys"
@@ -711,6 +717,12 @@ class PqvaultApp(App[None]):
     def main_screen(self):
         """The base screen (dialogs are pushed on top of it)."""
         return self.screen_stack[0]
+
+    def _save_theme(self, theme) -> None:
+        try:
+            self.keyring.set_setting("theme", theme.name)
+        except OSError as e:
+            self.notify(f"Couldn't save theme: {e}", severity="warning")
 
     def refresh_keys(self) -> None:
         table = self.main_screen.query_one("#keys", DataTable)

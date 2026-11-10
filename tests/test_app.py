@@ -245,3 +245,36 @@ def test_sign_without_key_explains(setup):
             await pilot.pause()
             assert "create a key first" in str(app.screen.query_one("#status").render())
     run(go())
+
+
+def test_theme_persists_across_sessions(setup):
+    kr, work = setup
+
+    async def first():
+        app = PqvaultApp(kr, work)
+        async with app.run_test() as pilot:
+            assert app.theme != "nord"
+            app.theme = "nord"
+            await pilot.pause()
+
+    async def second():
+        app = PqvaultApp(kr, work)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.theme == "nord"
+
+    run(first())
+    assert kr.setting("theme") == "nord"
+    run(second())
+
+
+def test_unknown_saved_theme_is_ignored(setup):
+    kr, work = setup
+    kr.set_setting("theme", "no-such-theme")
+
+    async def go():
+        app = PqvaultApp(kr, work)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.theme in app.available_themes
+    run(go())

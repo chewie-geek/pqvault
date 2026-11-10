@@ -2,7 +2,7 @@
 
     identities/NAME.key  NAME.pub   your own keypairs (private key passphrase-protected)
     contacts/NAME.pub               other people's public keys you have imported
-    config.json                     {"default": NAME}
+    config.json                     {"default": NAME, "theme": NAME, ...}
 
 Importing a contact means "I trust that this key belongs to NAME", so the
 app asks you to confirm the fingerprint with its owner first.
@@ -106,8 +106,16 @@ class Keyring:
     def default(self, name: str) -> None:
         if not (self.identities_dir / f"{check_name(name)}.key").exists():
             raise PQVaultError(f"no identity named {name!r}")
+        self.set_setting("default", name)
+
+    # --- app settings (stored alongside the default key in config.json) ---
+
+    def setting(self, key: str, fallback=None):
+        return self._config().get(key, fallback)
+
+    def set_setting(self, key: str, value) -> None:
         cfg = self._config()
-        cfg["default"] = name
+        cfg[key] = value
         (self.home / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
 
     # --- contacts ---
